@@ -1936,6 +1936,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    if (ggml_cuda_moe_cache_direct_mmv(ctx, src0, src1, ids, dst)) {
+                        return;
+                    }
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -5505,6 +5508,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+    if (strcmp(name, "ggml_cuda_moe_cache_materialize_enabled") == 0) {
+        return (void *)ggml_cuda_moe_cache_materialize_enabled;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_materialize") == 0) {
+        return (void *)ggml_cuda_moe_cache_materialize;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_direct_materialize") == 0) {
+        return (void *)ggml_cuda_moe_cache_direct_materialize;
+    }
+    if (strcmp(name, "ggml_cuda_moe_cache_direct_materialize_gpu_ids") == 0) {
+        return (void *)ggml_cuda_moe_cache_direct_materialize_gpu_ids;
+    }
     return nullptr;
 }
 
@@ -5525,7 +5540,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
         std::lock_guard<std::mutex> lock(mutex);
         if (!initialized) {
             ggml_backend_cuda_reg_context * ctx = new ggml_backend_cuda_reg_context;
-            const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 1;
 
             const ggml_cuda_device_info & info = ggml_cuda_info();
             const bool virtual_devices = info.device_count > info.physical_device_count;

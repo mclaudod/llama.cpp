@@ -1684,6 +1684,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    std::vector<int32_t> used_expert_ids;
 
     int prev_backend_id = -1;
 
@@ -1752,63 +1753,153 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
 
-                    if (ids_tensor != prev_ids_tensor) {
-                        ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
-                        ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
+                    bool cache_materialized = false;
 
-                        // find the used experts
-                        used_ids.clear();
-                        used_ids.resize(ggml_bitset_size(n_expert));
-                        for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
-                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
-                                int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                                GGML_ASSERT(id >= 0 && id < n_expert);
-                                ggml_bitset_set(used_ids.data(), id);
+                    const bool direct_shape_eligible =
+                        node->ne[2] >= 1 && node->ne[2] <= 8 && node->ne[3] == 1 &&
+                        node->src[1] && node->src[1]->type == GGML_TYPE_F32 &&
+                        node->src[1]->ne[2] == node->ne[2] && node->src[1]->ne[3] == 1 &&
+                        ids_tensor && ids_tensor->type == GGML_TYPE_I32 &&
+                        ids_tensor->ne[1] == node->ne[2] &&
+                        ids_tensor->nb[0] == sizeof(int32_t) &&
+                        node->type == GGML_TYPE_F32 &&
+                        ggml_is_quantized(input->type);
+
+                    using materialize_enabled_fn = int (*)(void);
+                    using materialize_fn = int (*)(
+                        void *, const char *, const void *, size_t, size_t, int, int64_t,
+                        const int32_t *, int, void *);
+                    using direct_materialize_fn = int (*)(
+                        void *, const char *, const void *, size_t, size_t, int, int64_t,
+                        const int32_t *, int, void *);
+                    using direct_gpu_ids_fn = int (*)(
+                        void *, const char *, const void *, size_t, size_t, int, int64_t,
+                        const int32_t *, int64_t, int64_t, size_t, const void *, void *);
+
+                    materialize_enabled_fn materialize_enabled = nullptr;
+                    materialize_fn materialize = nullptr;
+                    direct_materialize_fn direct_materialize = nullptr;
+                    direct_gpu_ids_fn direct_gpu_ids = nullptr;
+                    if (sched->moe_cache_session) {
+                        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(
+                            ggml_backend_get_device(split_backend));
+                        materialize_enabled = (materialize_enabled_fn)
+                            ggml_backend_reg_get_proc_address(
+                                reg, "ggml_cuda_moe_cache_materialize_enabled");
+                        materialize = (materialize_fn)
+                            ggml_backend_reg_get_proc_address(
+                                reg, "ggml_cuda_moe_cache_materialize");
+                        direct_materialize = (direct_materialize_fn)
+                            ggml_backend_reg_get_proc_address(
+                                reg, "ggml_cuda_moe_cache_direct_materialize");
+                        direct_gpu_ids = (direct_gpu_ids_fn)
+                            ggml_backend_reg_get_proc_address(
+                                reg, "ggml_cuda_moe_cache_direct_materialize_gpu_ids");
+                    }
+
+                    // V1.5: when the routing IDs already live on the CUDA split
+                    // backend, launch the miss materialization directly from those
+                    // device IDs. This is ordered on the same CUDA stream as the
+                    // producer and removes the blocking D2H ID readback.
+                    if (direct_shape_eligible && direct_gpu_ids &&
+                        materialize_enabled && materialize_enabled() &&
+                        ids_backend == split_backend) {
+                        cache_materialized = direct_gpu_ids(
+                            split_backend, input->name, input->data, ggml_nbytes(input),
+                            expert_size, (int)input->type, n_expert,
+                            (const int32_t *)ids_tensor->data,
+                            ids_tensor->ne[0], ids_tensor->ne[1], ids_tensor->nb[1],
+                            ids_tensor, input_cpy->data) != 0;
+                    }
+
+                    if (!cache_materialized) {
+                        if (ids_tensor != prev_ids_tensor) {
+                            ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                            ggml_backend_tensor_get_async(
+                                ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                            ggml_backend_synchronize(ids_backend);
+
+                            // Find the used experts for the CPU-ID fallback path.
+                            used_ids.clear();
+                            used_ids.resize(ggml_bitset_size(n_expert));
+                            for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+                                for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                                    int32_t id = ids[
+                                        i1 * ids_tensor->nb[1]/sizeof(int32_t) +
+                                        i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+                                    GGML_ASSERT(id >= 0 && id < n_expert);
+                                    ggml_bitset_set(used_ids.data(), id);
+                                }
+                            }
+                            prev_ids_tensor = ids_tensor;
+                        }
+
+                        if (materialize_enabled && materialize && materialize_enabled()) {
+                            used_expert_ids.clear();
+                            for (int32_t id = 0; id < n_expert; ++id) {
+                                if (ggml_bitset_get(used_ids.data(), id)) {
+                                    used_expert_ids.push_back(id);
+                                }
+                            }
+                            if (!used_expert_ids.empty()) {
+                                if (direct_shape_eligible && direct_materialize) {
+                                    cache_materialized = direct_materialize(
+                                        split_backend, input->name, input->data, ggml_nbytes(input),
+                                        expert_size, (int)input->type, n_expert,
+                                        used_expert_ids.data(), (int)used_expert_ids.size(),
+                                        input_cpy->data) != 0;
+                                }
+                                if (!cache_materialized) {
+                                    cache_materialized = materialize(
+                                        split_backend, input->name, input->data, ggml_nbytes(input),
+                                        expert_size, (int)input->type, n_expert,
+                                        used_expert_ids.data(), (int)used_expert_ids.size(),
+                                        input_cpy->data) != 0;
+                                }
                             }
                         }
-
-                        prev_ids_tensor = ids_tensor;
                     }
 
-                    // group consecutive experts and copy them together
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        const size_t expert_offset = first_id * expert_size;
-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
-                        const size_t padding = std::min<size_t>(expert_size, 512);
-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                    if (!cache_materialized) {
+                        // group consecutive experts and copy them together
+                        auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                            const size_t expert_offset = first_id * expert_size;
+                            const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                            const size_t padding = std::min<size_t>(expert_size, 512);
+                            const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
-                    };
+                            ggml_backend_tensor_set_async(split_backend,
+                                input_cpy,
+                                (const uint8_t *)input->data + expert_offset, expert_offset,
+                                // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                                // this is necessary for MMQ in the CUDA backend
+                                expert_size_copy + padding_end);
+                        };
 
-                    int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
-                        id++;
-                    }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
-
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
+                        int id = 0;
+                        while (!ggml_bitset_get(used_ids.data(), id)) {
+                            id++;
                         }
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
 
-                        if (id == last_id + 1) {
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                continue;
+                            }
+
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            copy_experts(first_id, last_id);
+
+                            first_id = id;
                             last_id = id;
-                            continue;
                         }
-
                         copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
                     }
-                    copy_experts(first_id, last_id);
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
