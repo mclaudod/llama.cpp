@@ -283,11 +283,43 @@ static __global__ void moe_cache_gpu_ids_prepare_kernel(moe_cache_gpu_ids_batch 
     }
 }
 
-// V1.4 POC is intentionally limited to the three quantized expert shapes
-// used by Qwen3.6-35B-A3B Q4_K_XL on the current Ampere test target.
+// Keep the direct-resident path aligned with the self-contained quantized
+// types supported by CUDA MMVQ (mmvq.cu:get_vec_dot_q_cuda/get_vdr_mmvq).
+// NVFP4 is intentionally excluded for now because native MMVQ can consume
+// auxiliary per-tensor scale metadata through fusion args, while the resident
+// pointer-table path currently publishes only the expert-weight base pointer.
+#define MOE_CACHE_DIRECT_MMVQ_TYPE_LIST(X) \
+    X(GGML_TYPE_Q1_0,    vec_dot_q1_0_q8_1,    VDR_Q1_0_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q2_0,    vec_dot_q2_0_q8_1,    VDR_Q2_0_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q4_0,    vec_dot_q4_0_q8_1,    VDR_Q4_0_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q4_1,    vec_dot_q4_1_q8_1,    VDR_Q4_1_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q5_0,    vec_dot_q5_0_q8_1,    VDR_Q5_0_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q5_1,    vec_dot_q5_1_q8_1,    VDR_Q5_1_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q8_0,    vec_dot_q8_0_q8_1,    VDR_Q8_0_Q8_1_MMVQ) \
+    X(GGML_TYPE_MXFP4,   vec_dot_mxfp4_q8_1,   VDR_MXFP4_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q2_K,    vec_dot_q2_K_q8_1,    VDR_Q2_K_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q3_K,    vec_dot_q3_K_q8_1,    VDR_Q3_K_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q4_K,    vec_dot_q4_K_q8_1,    VDR_Q4_K_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q5_K,    vec_dot_q5_K_q8_1,    VDR_Q5_K_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q6_K,    vec_dot_q6_K_q8_1,    VDR_Q6_K_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ2_XXS, vec_dot_iq2_xxs_q8_1, VDR_IQ2_XXS_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ2_XS,  vec_dot_iq2_xs_q8_1,  VDR_IQ2_XS_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ2_S,   vec_dot_iq2_s_q8_1,   VDR_IQ2_S_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ3_XXS, vec_dot_iq3_xxs_q8_1, VDR_IQ3_XXS_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ1_S,   vec_dot_iq1_s_q8_1,   1) \
+    X(GGML_TYPE_IQ1_M,   vec_dot_iq1_m_q8_1,   1) \
+    X(GGML_TYPE_IQ4_NL,  vec_dot_iq4_nl_q8_1,  VDR_IQ4_NL_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ4_XS,  vec_dot_iq4_xs_q8_1,  VDR_IQ4_XS_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ3_S,   vec_dot_iq3_s_q8_1,   VDR_IQ3_S_Q8_1_MMVQ)
+
 static bool moe_cache_scheduler_direct_type_supported(ggml_type type) {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
-           type == GGML_TYPE_Q6_K;
+    switch (type) {
+#define MOE_CACHE_DIRECT_SUPPORTED_CASE(type_name, vec_fn, vdr) \
+        case type_name: return true;
+        MOE_CACHE_DIRECT_MMVQ_TYPE_LIST(MOE_CACHE_DIRECT_SUPPORTED_CASE)
+#undef MOE_CACHE_DIRECT_SUPPORTED_CASE
+        default: return false;
+    }
 }
 
 using moe_cache_vec_dot_q_cuda_t = float (*)(
@@ -298,28 +330,20 @@ using moe_cache_vec_dot_q_cuda_t = float (*)(
 template <ggml_type type>
 static constexpr __device__ moe_cache_vec_dot_q_cuda_t
 moe_cache_get_vec_dot_q_cuda() {
-    if constexpr (type == GGML_TYPE_Q4_K) {
-        return vec_dot_q4_K_q8_1;
-    } else if constexpr (type == GGML_TYPE_Q5_K) {
-        return vec_dot_q5_K_q8_1;
-    } else if constexpr (type == GGML_TYPE_Q6_K) {
-        return vec_dot_q6_K_q8_1;
-    } else {
-        return nullptr;
-    }
+#define MOE_CACHE_DIRECT_VEC_CASE(type_name, vec_fn, vdr) \
+    if constexpr (type == type_name) { return vec_fn; } else
+    MOE_CACHE_DIRECT_MMVQ_TYPE_LIST(MOE_CACHE_DIRECT_VEC_CASE)
+#undef MOE_CACHE_DIRECT_VEC_CASE
+    { return nullptr; }
 }
 
 template <ggml_type type>
 static constexpr __host__ __device__ int moe_cache_get_vdr_mmvq() {
-    if constexpr (type == GGML_TYPE_Q4_K) {
-        return VDR_Q4_K_Q8_1_MMVQ;
-    } else if constexpr (type == GGML_TYPE_Q5_K) {
-        return VDR_Q5_K_Q8_1_MMVQ;
-    } else if constexpr (type == GGML_TYPE_Q6_K) {
-        return VDR_Q6_K_Q8_1_MMVQ;
-    } else {
-        return 1;
-    }
+#define MOE_CACHE_DIRECT_VDR_CASE(type_name, vec_fn, vdr_value) \
+    if constexpr (type == type_name) { return vdr_value; } else
+    MOE_CACHE_DIRECT_MMVQ_TYPE_LIST(MOE_CACHE_DIRECT_VDR_CASE)
+#undef MOE_CACHE_DIRECT_VDR_CASE
+    { return 1; }
 }
 
 // Single-token MUL_MAT_ID with one stable pointer-table lookup per routed
@@ -574,9 +598,9 @@ static void moe_cache_direct_mmv_ptrs(
             n_hits, act_rows, stream); \
         break
     switch (type) {
-        MOE_CACHE_DIRECT_CASE(GGML_TYPE_Q4_K);
-        MOE_CACHE_DIRECT_CASE(GGML_TYPE_Q5_K);
-        MOE_CACHE_DIRECT_CASE(GGML_TYPE_Q6_K);
+#define MOE_CACHE_DIRECT_DISPATCH_CASE(type_name, vec_fn, vdr) MOE_CACHE_DIRECT_CASE(type_name);
+        MOE_CACHE_DIRECT_MMVQ_TYPE_LIST(MOE_CACHE_DIRECT_DISPATCH_CASE)
+#undef MOE_CACHE_DIRECT_DISPATCH_CASE
         default:
             GGML_ABORT("unsupported scheduler-direct MoE type");
     }
@@ -607,14 +631,16 @@ static void moe_cache_direct_mmv_moe_ptrs(
             stride_channel_dst, stride_token_dst, stream); \
         break
     switch (type) {
-        MOE_CACHE_DIRECT_MOE_CASE(GGML_TYPE_Q4_K);
-        MOE_CACHE_DIRECT_MOE_CASE(GGML_TYPE_Q5_K);
-        MOE_CACHE_DIRECT_MOE_CASE(GGML_TYPE_Q6_K);
+#define MOE_CACHE_DIRECT_MOE_DISPATCH_CASE(type_name, vec_fn, vdr) MOE_CACHE_DIRECT_MOE_CASE(type_name);
+        MOE_CACHE_DIRECT_MMVQ_TYPE_LIST(MOE_CACHE_DIRECT_MOE_DISPATCH_CASE)
+#undef MOE_CACHE_DIRECT_MOE_DISPATCH_CASE
         default:
             GGML_ABORT("unsupported scheduler-direct multi-token MoE type");
     }
 #undef MOE_CACHE_DIRECT_MOE_CASE
 }
+
+#undef MOE_CACHE_DIRECT_MMVQ_TYPE_LIST
 
 
 
